@@ -7,9 +7,10 @@ import {
   type ToolDefinition,
   ModelRuntime,
   SessionManager,
+  SettingsManager,
   createAgentSession,
 } from "@earendil-works/pi-coding-agent";
-import type { ImageContent, TextContent, ThinkingLevel } from "@earendil-works/pi-ai";
+import type { ImageContent, ModelThinkingLevel, TextContent } from "@earendil-works/pi-ai";
 import type { TSchema } from "typebox";
 
 export interface OpenJetPiModel {
@@ -24,11 +25,12 @@ export interface OpenJetPiModel {
   contextWindow: number;
   maxTokens: number;
   samplingParams?: Record<string, unknown>;
+  samplingParamsByThinkingLevel?: Partial<Record<ModelThinkingLevel, Record<string, unknown>>>;
   nativeContextWindow?: number;
   cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
   compat?: Record<string, unknown>;
   headers?: Record<string, string>;
-  thinkingLevel?: ThinkingLevel;
+  thinkingLevel?: ModelThinkingLevel;
   thinkingLevelMap?: Record<string, string | null>;
 }
 
@@ -133,12 +135,46 @@ export function modelConfigPayload(model: OpenJetPiModel): Record<string, unknow
           contextWindow: model.contextWindow,
           maxTokens: model.maxTokens,
           samplingParams: model.samplingParams,
+          samplingParamsByThinkingLevel: model.samplingParamsByThinkingLevel,
           thinkingLevelMap: model.thinkingLevelMap,
           cost: model.cost,
         }],
       },
     },
   };
+}
+
+// Pi's compaction defaults are sized for 200K+ cloud windows. On a 32K local
+// window they compact at 16K and keep 20K, which is over the threshold again on
+// the next turn, so every turn re-summarizes on the slow local model.
+const PI_COMPACTION_RESERVE_TOKENS = 16384;
+const PI_COMPACTION_KEEP_RECENT_TOKENS = 20000;
+
+export function compactionTokensForWindow(contextWindow: number): { reserveTokens: number; keepRecentTokens: number } {
+  const quarter = Math.max(1024, Math.floor(contextWindow / 4));
+  return {
+    reserveTokens: Math.min(PI_COMPACTION_RESERVE_TOKENS, quarter),
+    keepRecentTokens: Math.min(PI_COMPACTION_KEEP_RECENT_TOKENS, quarter),
+  };
+}
+
+/**
+ * Size compaction to each model's window unless the user configured it in settings.json.
+ * In-memory only: call after createAgentSession, whose resource loader reloads settings.
+ */
+export function applyCompactionDefaults(settings: SettingsManager, models: OpenJetPiModel[]): void {
+  const configured = settings.getSettings().compaction;
+  if (configured?.reserveTokens !== undefined || configured?.keepRecentTokens !== undefined) return;
+  const modelOverrides: Record<string, { reserveTokens: number; keepRecentTokens: number }> = {};
+  for (const model of models) {
+    const key = `${model.provider}/${model.id}`;
+    if (configured?.modelOverrides?.[key] === undefined) modelOverrides[key] = compactionTokensForWindow(model.contextWindow);
+  }
+  settings.applyOverrides({ compaction: { modelOverrides } });
+}
+
+export function thinkingLevelFor(model: OpenJetPiModel): ModelThinkingLevel {
+  return model.reasoning ? model.thinkingLevel ?? "medium" : "off";
 }
 
 function contentText(value: unknown): string {
@@ -181,6 +217,17 @@ export function describeModelError(error: { errorMessage?: string } | undefined)
   return raw;
 }
 
+/**
+ * The provider error a settled run ended on, if Pi could not recover from it.
+ * Pi reports request failures only as an assistant message with stopReason
+ * "error" (never as a message_update), after its own retries and compaction.
+ */
+export function unrecoveredModelError(messages: readonly unknown[]): string | undefined {
+  const last = messages.at(-1) as { role?: string; stopReason?: string; errorMessage?: string } | undefined;
+  if (last?.role !== "assistant" || last.stopReason !== "error") return undefined;
+  return describeModelError(last);
+}
+
 export function sessionEventToUiEvents(event: AgentSessionEvent, attribution?: ModelAttribution): PiUiEvent[] {
   const attributed = (events: PiUiEventPayload[]): PiUiEvent[] => events.map((item) => ({ ...item, ...attribution }));
   if (event.type === "message_start" && event.message.role === "assistant") {
@@ -194,9 +241,6 @@ export function sessionEventToUiEvents(event: AgentSessionEvent, attribution?: M
     ]);
     if (update.type === "thinking_delta") return attributed([{ type: "reasoning_delta", text: update.delta }]);
     if (update.type === "toolcall_delta") return attributed([{ type: "generation_chunk", text: update.delta }]);
-    if (update.type === "error") {
-      return attributed([{ type: "notice", text: describeModelError(update.error), level: "error" }]);
-    }
   } else if (event.type === "tool_execution_start") {
     return attributed([{ type: "tool_start", callId: event.toolCallId, name: event.toolName, args: event.args }]);
   } else if (event.type === "tool_execution_update") {
@@ -247,6 +291,7 @@ export class OpenJetPiAgent {
   private session?: AgentSession;
   private unsubscribe?: () => void;
   private modelsPath?: string;
+  private settings?: SettingsManager;
   private workspace = process.cwd();
   private mode: AgentMode = "local";
   private localModel?: OpenJetPiModel;
@@ -279,7 +324,9 @@ export class OpenJetPiAgent {
     this.modelsPath = modelsPath;
     await mkdir(sessionsDir, { recursive: true, mode: 0o700 });
     await chmod(agentDir, 0o700);
-    await this.writeModelConfig(modelsPath, [model, ...(localModel && localModel.id !== model.id ? [localModel] : [])]);
+    const models = [model, ...(localModel && localModel.id !== model.id ? [localModel] : [])];
+    await this.writeModelConfig(modelsPath, models);
+    const settings = SettingsManager.create(cwd, agentDir);
 
     const modelRuntime = await ModelRuntime.create({
       modelsPath,
@@ -295,13 +342,16 @@ export class OpenJetPiAgent {
       agentDir,
       modelRuntime,
       model: selectedModel,
-      thinkingLevel: model.reasoning ? model.thinkingLevel ?? "medium" : "off",
+      thinkingLevel: thinkingLevelFor(model),
+      settingsManager: settings,
       sessionManager: sessionPath
         ? SessionManager.open(sessionPath, sessionsDir)
         : SessionManager.create(cwd, sessionsDir),
       customTools,
     });
     this.session = created.session;
+    applyCompactionDefaults(settings, models);
+    this.settings = settings;
     this.unsubscribe = this.session.subscribe((event) => this.handleEvent(event));
     if (created.modelFallbackMessage) this.emit({ type: "notice", text: created.modelFallbackMessage, level: "warning" });
   }
@@ -316,9 +366,10 @@ export class OpenJetPiAgent {
     });
     const selectedModel = modelRuntime.getModel(model.provider, model.id);
     if (!selectedModel) throw new Error(`Pi could not load OpenJet model ${model.provider}/${model.id}`);
+    if (this.settings) applyCompactionDefaults(this.settings, [model]);
     await this.session.setModel(selectedModel);
     this.primaryModel = model;
-    this.session.setThinkingLevel(model.reasoning ? model.thinkingLevel ?? "medium" : "off");
+    this.session.setThinkingLevel(thinkingLevelFor(model));
   }
 
   private async writeModelConfig(modelsPath: string, models: OpenJetPiModel[]): Promise<void> {
@@ -414,6 +465,7 @@ export class OpenJetPiAgent {
     this.session?.dispose();
     this.session = undefined;
     this.modelsPath = undefined;
+    this.settings = undefined;
   }
 
   private createOpenJetTool(descriptor: OpenJetToolDescriptor): ToolDefinition {
@@ -465,15 +517,19 @@ export class OpenJetPiAgent {
     const runtime = await ModelRuntime.create({ modelsPath: this.modelsPath, allowModelNetwork: false, refreshOnCreate: true });
     const model = runtime.getModel(this.localModel.provider, this.localModel.id);
     if (!model) throw new Error(`Pi could not load local worker ${this.localModel.provider}/${this.localModel.id}`);
+    const workerDir = join(this.workspace, ".openjet", "pi-worker");
+    const workerSettings = SettingsManager.create(this.workspace, workerDir);
     const worker = await createAgentSession({
       cwd: this.workspace,
-      agentDir: join(this.workspace, ".openjet", "pi-worker"),
+      agentDir: workerDir,
       modelRuntime: runtime,
       model,
-      thinkingLevel: this.localModel.reasoning ? "medium" : "off",
+      thinkingLevel: thinkingLevelFor(this.localModel),
+      settingsManager: workerSettings,
       sessionManager: SessionManager.inMemory(this.workspace),
       customTools: this.openjetTools.map((tool) => this.createOpenJetTool(tool)),
     });
+    applyCompactionDefaults(workerSettings, [this.localModel]);
     const task = String(params.task ?? "").trim();
     const acceptance = String(params.acceptance_criteria ?? "").trim();
     const attribution: ModelAttribution = { lane: "local", model: this.localModel.name, parentCallId };
@@ -494,6 +550,8 @@ export class OpenJetPiAgent {
         `You are the local implementation agent. Inspect, edit, test, and iterate autonomously. Do not delegate.\n\nTask:\n${task}${acceptance ? `\n\nAcceptance criteria:\n${acceptance}` : ""}\n\nReturn only a concise handoff: files changed, tests and outcomes, and remaining risks.`,
         { source: "interactive" },
       );
+      const error = unrecoveredModelError(worker.session.messages);
+      if (error) throw new Error(`Local worker failed: ${error}`);
       const assistant = [...worker.session.messages].reverse().find((message) => message.role === "assistant");
       const text = contentText(assistant?.content).trim() || "Local worker completed without a textual handoff.";
       const stats = worker.session.getSessionStats();
@@ -533,6 +591,8 @@ export class OpenJetPiAgent {
       this.emitTrace("model_tool_end", attribution, { callId: event.toolCallId, tool: event.toolName, ok: !event.isError });
     }
     if (event.type === "agent_settled" && this.session) {
+      const error = unrecoveredModelError(this.session.messages);
+      if (error) this.emit({ type: "notice", text: error, level: "error", ...attribution });
       const stats = this.session.getSessionStats();
       this.emitTrace("model_turn_end", attribution, { ...tokenTraceData(stats.tokens), cost: stats.cost });
       this.emit({ type: "turn_complete", stats, ...attribution });
