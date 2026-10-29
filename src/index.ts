@@ -394,7 +394,6 @@ async function handleLoginCommand(): Promise<void> {
 async function configureOpenRouterModel(): Promise<void> {
   const selected = await pickOpenRouterModel({
     ...piUi(),
-    cwd: process.cwd(),
     currentModelId: activeOpenrouterModel.replace(/^openrouter\//, ""),
   });
   if (!selected) return;

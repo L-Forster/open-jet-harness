@@ -4,7 +4,6 @@ import {
   LoginDialogComponent,
   ModelRuntime,
   ModelSelectorComponent,
-  SettingsManager,
   initTheme,
   readStoredCredential,
 } from "@earendil-works/pi-coding-agent";
@@ -61,20 +60,17 @@ export function pickOpenRouterModel(options: {
   tui: TUI;
   editorContainer: Container;
   editor: Editor;
-  cwd: string;
   currentModelId?: string;
 }): Promise<string | undefined> {
   ensurePiTheme();
   return new Promise((resolve, reject) => {
     void (async () => {
       const runtime = await openRouterRuntime();
-      const settings = SettingsManager.create(options.cwd);
       const scoped = runtime.getModels("openrouter").map((model) => ({ model }));
       const current = scoped.find((item) => item.model.id === options.currentModelId)?.model;
       const selector = new ModelSelectorComponent(
         options.tui,
         current,
-        settings,
         runtime,
         scoped,
         (model) => {
